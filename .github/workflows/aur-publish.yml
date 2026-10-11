@@ -1,0 +1,32 @@
+name: Publish to AUR
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - PKGBUILD
+      - .github/workflows/aur-publish.yml
+  workflow_dispatch:
+
+concurrency:
+  group: aur-publish
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    if: github.repository == '9sx77ssl/dota2-minify-aur'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Sync PKGBUILD to AUR
+        uses: KSXGitHub/github-actions-deploy-aur@v4.2.0
+        with:
+          pkgname: dota2-minify-git
+          pkgbuild: ./PKGBUILD
+          commit_username: ${{ secrets.AUR_USERNAME }}
+          commit_email: ${{ secrets.AUR_EMAIL }}
+          ssh_private_key: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
+          commit_message: "chore: sync PKGBUILD from GitHub"
+          ssh_keyscan_types: rsa,ecdsa,ed25519

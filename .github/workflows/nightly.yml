@@ -1,0 +1,124 @@
+name: Nightly (verify build + bump + publish)
+
+on:
+  schedule:
+    - cron: '0 4 * * *'
+  workflow_dispatch:
+
+concurrency:
+  group: nightly
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    name: Verify build from latest upstream
+    runs-on: ubuntu-latest
+    container:
+      image: archlinux:base-devel
+    steps:
+      - name: Install build dependencies
+        run: |
+          pacman -Syu --noconfirm --needed \
+            git nodejs npm uv icoutils \
+            gtk3 webkit2gtk-4.1 gobject-introspection \
+            freetype2 fontconfig hicolor-icon-theme
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build package as non-root
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          useradd -m builder || true
+          chown -R builder:builder "$GITHUB_WORKSPACE"
+          su builder -c 'cd "$GITHUB_WORKSPACE" && makepkg -f --nodeps --noconfirm'
+
+  bump:
+    name: Bump pkgver and publish to AUR
+    needs: verify
+    if: github.repository == '9sx77ssl/dota2-minify-aur'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      changed: ${{ steps.commit.outputs.changed }}
+      version: ${{ steps.pkgver.outputs.ver }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Compute latest upstream pkgver
+        id: pkgver
+        run: |
+          git clone --quiet https://github.com/Egezenn/dota2-minify.git /tmp/upstream
+          cd /tmp/upstream
+          ver="$(git describe --long --tags --abbrev=7 2>/dev/null | sed 's/^Minify-v//; s/\([^-]*-g\)/r\1/; s/-/./g')"
+          [ -n "$ver" ] || ver="r$(git rev-list --count HEAD).$(git rev-parse --short=7 HEAD)"
+          echo "ver=$ver" >> "$GITHUB_OUTPUT"
+          echo "latest upstream pkgver: $ver"
+
+      - name: Update PKGBUILD if pkgver changed
+        id: commit
+        run: |
+          current="$(grep -oP '^pkgver=\K.*' PKGBUILD)"
+          new="${{ steps.pkgver.outputs.ver }}"
+          if [ "$current" = "$new" ]; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "pkgver already up to date ($current)"
+            exit 0
+          fi
+          sed -i "s/^pkgver=.*/pkgver=${new}/" PKGBUILD
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add PKGBUILD
+          git commit -m "pkgver: ${new} (latest upstream)"
+          git push origin HEAD:main
+          echo "changed=true" >> "$GITHUB_OUTPUT"
+
+      - name: Publish updated PKGBUILD to AUR
+        if: steps.commit.outputs.changed == 'true'
+        uses: KSXGitHub/github-actions-deploy-aur@v4.2.0
+        with:
+          pkgname: dota2-minify-git
+          pkgbuild: ./PKGBUILD
+          commit_username: ${{ secrets.AUR_USERNAME }}
+          commit_email: ${{ secrets.AUR_EMAIL }}
+          ssh_private_key: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
+          commit_message: "pkgver: ${{ steps.pkgver.outputs.ver }}"
+          ssh_keyscan_types: rsa,ecdsa,ed25519
+
+  report:
+    name: Open issue on failure
+    needs: verify
+    if: failure() && github.repository == '9sx77ssl/dota2-minify-aur'
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+    steps:
+      - name: Create or update failure issue
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            try {
+              await github.rest.issues.getLabel({ owner, repo, name: 'ci-failure' });
+            } catch (e) {
+              await github.rest.issues.createLabel({ owner, repo, name: 'ci-failure', color: 'd73a4a', description: 'Automated build failure' });
+            }
+            const date = new Date().toISOString().slice(0, 10);
+            const title = `Nightly build failed (${date})`;
+            const runUrl = `${context.serverUrl}/${owner}/${repo}/actions/runs/${context.runId}`;
+            const body = [
+              'The nightly build of the latest upstream commit failed.',
+              '',
+              `- Workflow run: ${runUrl}`,
+              `- Upstream: https://github.com/Egezenn/dota2-minify`,
+              '',
+              'Fix the PKGBUILD (micro-edits are fine) and push to `main`; the `Publish to AUR` workflow will sync it.',
+            ].join('\n');
+            const open = await github.rest.issues.listForRepo({ owner, repo, state: 'open', labels: 'ci-failure' });
+            if (open.data.some((i) => i.title.startsWith('Nightly build failed'))) {
+              console.log('Failure issue already open, skipping duplicate.');
+              return;
+            }
+            await github.rest.issues.create({ owner, repo, title, body, labels: ['ci-failure'] });
